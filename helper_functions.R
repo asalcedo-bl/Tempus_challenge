@@ -57,8 +57,31 @@ collapse_alleles <- function(x, separator=","){
 	return(collapsed_alleles)
 }
 
+
 annotate_variants <- function(vcf, samples){
+	vcf_info <- info(vcf)
+	total_depth <- vcf_info$DP
+	total_alt_dp <- vcf_info$AO
+	total_alt_dp_collapsed <- laply(total_alt_dp, function(x) ifelse(length(x) > 1, collapse_alleles(x), as.character(x)))
+
+	total_alt_read_percent <- round(total_alt_dp/total_depth*100,2)
+	total_alt_read_percent_collapsed <- laply(total_alt_read_percent, function(x) ifelse(length(x) > 1, collapse_alleles(x), as.character(x)))
+
+	return(data.frame(total_depth=total_depth, n_alt_reads=total_alt_dp_collapsed, total_alt_read_percent=total_alt_read_percent_collapsed))	
+}
+
+
+run_annotation <- function(vcf, samples, chunk_size=1000){
 	alt_alleles <- laply(alt(vcf), collapse_alleles)
-	annotation <- data.frame(chr=as.character(seqnames(vcf)), start=start(vcf), id=rownames(info(vcf)), ref=as.character(ref(vcf)), alt=alt_alleles)
+	basic_annotation <- data.frame(chr=as.character(seqnames(vcf)), start=start(vcf), id=rownames(info(vcf)), qual=qual(vcf), ref=as.character(ref(vcf)), alt=alt_alleles, reference_dp=info(vcf)$RO)
+	
+
+	range_start <- seq(1,length(vcf), by=chunk_size)
+	range_end <- seq((chunk_size+1), length(vcf),by=chunk_size)
+	range_end <- c(range_end, length(vcf))
+	vcf_ranges <- cbind(range_start, range_end)
+
+	# source("helper_functions.R")
+	variant_annotation <- adply(vcf_ranges, 1, .id='id',function(x) annotate_variants(vcf[x[1]:x[2]]))
 }
 
