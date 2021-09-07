@@ -58,13 +58,13 @@ collapse_alleles <- function(x, separator=","){
 	return(collapsed_alleles)
 }
 
-annotate_ExAC_AF <- function(basic_annotation, vcf, alt_alleles){
-
+annotate_ExAC_AF <- function(annotation, vcf, alt_alleles){
+	# annotation is a data frame with at least four columns:  
 	# generate the basic ExAC query format necessary
-	ExAC_query <- paste0(basic_annotation$chr,"-", basic_annotation$start,"-",basic_annotation$ref,"-",basic_annotation$alt)
+	ExAC_query <- paste0(annotation$chr,"-", annotation$start,"-",annotation$ref,"-",annotation$alt)
 	# if a variant has more than one alternate allele separate each into a separate query
 	multi_allele <- sapply(grep(',',ExAC_query), function(i){
-															site <- basic_annotation[i,];
+															site <- annotation[i,];
 															paste0(site$chr,"-", site$start,"-",site$ref,"-", as.character(alt_alleles[[i]]))
 															})
 	multi_allele <- unlist(multi_allele)
@@ -96,22 +96,71 @@ annotate_ExAC_AF <- function(basic_annotation, vcf, alt_alleles){
 
 }
 
-annotate_variants <- function(vcf, samples){
+extract_variant_effects <- function(vcf, variant_effects=NULL){
+	# annotates each variant in a VCF object with 
+	# vcf is the VCF object to annotate
+	#  variant effects is an optional data frame with the ranking of variant severity. It should have two columns, one titled "impact" which has the variant impact label and one labelled "effect" which gives an ascending numeric ranking of the variant severity (so the most benign variant impacts will have the smallest effect and the most severe variants will have the largest)
+	# change chromosome names to be compatible with UCSC
+	vcf_query <- keepStandardChromosomes(vcf)
+	vcf_query <- dropSeqlevels(vcf_query,"MT")
+	seqlevelsStyle(vcf_query) <- "UCSC"
+	seqlevels(vcf_query)
+
+	all_var <- locateVariants(vcf_query, TxDb.Hsapiens.UCSC.hg19.knownGene, AllVariants())
+	coding_var <- predictCoding(vcf_query,TxDb.Hsapiens.UCSC.hg19.knownGene,BSgenome.Hsapiens.UCSC.hg19 )
+
+	# extract the relevant columns from each annotation 
+	all_var_df <- unique(data.frame(id=rownames(mcols(all_var)), impact=as.character(mcols(all_var)[,1]),stringsAsFactors=FALSE))
+	rm(all_var)
+	coding_var_df <-  unique(data.frame(id=rownames(mcols(coding_var)), impact=as.character(mcols(coding_var)[,"CONSEQUENCE"]),stringsAsFactors=FALSE))
+	rm(coding_var)
+
+	# if any variants are coding they will be more impactful
+	all_var_df <- all_var_df[!(all_var_df$id %in% coding_var_df[coding_var_df$impact != "synonymous",]$id),]
+	# generic "coding" annotations are less descriptive than those from predictCoding so remove them
+	all_var_df <- all_var_df[!(all_var_df$impact == "coding" & all_var_df$id %in% coding_var_df$id),]
+
+	all_var_df <- rbind(all_var_df, coding_var_df)
+	# extract a single id for each locus
+	all_var_df$loc_id <- gsub(":","_", gsub("_[ACTG].*","",all_var_df$id))
+
+	if(is.null(variant_effects)){
+		variant_effects <- data.frame(impact = c("coding","synonymous", "intergenenic", "intron", "threeUTR", "fiveUTR", "promoter",  "spliceSite", "nonsynonymous", "frameshift", "nonsense"),
+									  effect = c(1:11)
+									)
+	}
+
+	# for each locus output the more deleterious consequence as defined by the variant_effects dataframe
+	all_var_df <- merge(all_var_df, variant_effects, by="impact", all.x=TRUE)
+	variant_summary <- ddply(all_var_df, .(loc_id), function(x){
+																	return(x[which.max(x$effect),])
+																	})
+
+	return(variant_summary[,c("loc_id", "impact")])
+}
+
+
+annotate_variants <- function(vcf){
+
+
 	alt_alleles <- alt(vcf)
 	# there can be multiple alleles so collapse them into a single character value 
 	alt_alleles_collapsed <- laply(alt_alleles, collapse_alleles)
-	basic_annotation <- data.frame(chr=as.character(seqnames(vcf)), start=start(vcf), loc_id=rownames(info(vcf)), qual=qual(vcf), ref=as.character(ref(vcf)), alt=alt_alleles_collapsed, reference_dp=info(vcf)$RO)
-	
+	annotation <- data.frame(chr=as.character(seqnames(vcf)), start=start(vcf), loc_id=rownames(info(vcf)), qual=qual(vcf), ref=as.character(ref(vcf)), alt=alt_alleles_collapsed, reference_dp=info(vcf)$RO)
+	# extract depth information from the info fields
 	vcf_info <- info(vcf)
 	total_depth <- vcf_info$DP
 	total_alt_dp <- vcf_info$AO
 	total_alt_dp_collapsed <- laply(total_alt_dp, function(x) ifelse(length(x) > 1, collapse_alleles(x), as.character(x)))
-
 	total_alt_read_percent <- round(total_alt_dp/total_depth*100,2)
 	total_alt_read_percent_collapsed <- laply(total_alt_read_percent, function(x) ifelse(length(x) > 1, collapse_alleles(x), as.character(x)))
 
-	allele_freq <- annotate_ExAC_AF(basic_annotation, vcf, alt_alleles)
-	
+	allele_freq <- annotate_ExAC_AF(annotation, vcf, alt_alleles)
+	variant_effects <- extract_variant_effects(vcf)
+	variant_type <- laply(vcf_info$TYPE, function(x) ifelse(length(x) > 1, collapse_alleles(unlist(x)), as.character(unlist(x))))
+
+	annotation 
+
 	return(data.frame(total_depth=total_depth, n_alt_reads=total_alt_dp_collapsed, total_alt_read_percent=total_alt_read_percent_collapsed))	
 }
 
