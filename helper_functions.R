@@ -1,16 +1,16 @@
 
 process_inputs <- function(){
-	# reads a vcf from a system file and outputs a list with a VCF object, a character vector of the outputfile, and a list of samples to analyze
+	# reads a vcf from a system file and processes it with the VariantAnnotation packahe
+	# returns a list with a VCF object, a character vector of the outputfile, and a list of samples to analyze
 	# vcf_file is a character vertor length (1) with the vcf file to read
 	# output_file is a character vertor length (1) with the name of the output annotation file
 	# genome is the genome version
-	# samples is a character vector with the samples for which to output annotations
+	# chunk size is the number of records in the VCF to analyze at once. chunk_size of Inf (the default) will analyze the entire VCF at once. Users that are more constrained by memory may benefit from a smaller chunk_size. 
 	parser <- ArgumentParser()
 	parser$add_argument('--vcf_file', type = 'character', default = NULL)
 	parser$add_argument('--output_file', type = 'character', default = NULL)
-	parser$add_argument('--genome', type = 'character', default = "hg19")
-	parser$add_argument('--samples', type = 'character', default = "all")	
-	parser$add_argument('--chunk_size', type = 'integer', default = 1000)	
+	parser$add_argument('--genome', type = 'character', default = "hg19")	
+	parser$add_argument('--chunk_size', type = 'integer', default = NULL)	
 	args <- parser$parse_args()
 
 	vcf <- 	tryCatch(
@@ -30,27 +30,77 @@ process_inputs <- function(){
 		output_file <- gsub(".vcf", "_annotation.txt", args$vcf_file)
 	}else{
 		output_file <- args$output_file
+	}	
+
+	return(list(vcf=vcf, output_file=output_file, chunk_size=args$chunk_size))
+}
+
+
+
+run_annotation <- function(vcf, chunk_size=NULL, variant_effects=NULL){
+	# annotates a user provided VCF object by breaking it up into user defined chunks
+	# returns a data frame with the annotation for each variant. The dataframe contains the following annotations for each variant: the chromosome name, the start of the variant, its quality, the reference and alternate alleles, the number of alternate alleles, the number of reads supporting the reference and alternate alleles, the percent of reads supporting the alternate allele, the variant type, its predicted functional effect, and its frequency in ExAC
+	# vcf is the VCF-class object (see VariantAnnotation) to annotate
+	# chunk size is the number of records in the VCF to analyze at once. chunk_size of Inf (the default) will analyze the entire VCF at once. Users that are more constrained by memory may benefit from a smaller chunk_size. 	
+	# variant effects is an optional data frame with the ranking of variant severity. It should have two columns, one titled "impact" which has the variant impact label and one labelled "effect" which gives an ascending numeric ranking of the variant severity (so the most benign variant impacts will have the smallest effect and the most severe variants will have the largest)
+
+	n_variants <- length(vcf)
+	if( !is.null(chunk_size)){
+		#users may have different memory constraints depending on the file size and system 
+		range_start <- seq(1,n_variants, by=chunk_size)
+		range_end <- seq((chunk_size+1), n_variants,by=chunk_size)
+		range_end <- c(range_end, n_variants)
+		vcf_ranges <- cbind(range_start, range_end)
+	}else{
+		vcf_ranges <- matrix(c(1, n_variants), nrow=1, ncol=2)
 	}
 	
-	# gather samples to output	
-	all_samples <- samples(header(vcf))
-	if( 'all' == args$samples ){
-		samples <- all_samples
-	}else{
-	# check that all of the requested samples are in the vcf
-		a_ply(args$samples, 1, function(x) if(!(x %in% all_samples)) warning( paste(x, "not found in vcf file")))
-		samples <- all_samples[all_samples %in% args$samples]
-	}
+	variant_annotation <- adply(vcf_ranges, 1, .id='id',function(x) annotate_variants(vcf[x[1]:x[2]], variant_effects=variant_effects))
+	variant_annotation$id <- NULL
+	return(variant_annotation)
+}
 
-	if(length(samples) == 0){
-		stop("No samples specified. Specify valid sample names for which to annotate variants or 'all' for to output annotation for all samples")
-	}
 
-	return(list(vcf=vcf, output_file=output_file, samples=samples))
+annotate_variants <- function(vcf, variant_effects=NULL){
+	# annotates a user provided vcf with descriptive features
+	# returns a dataframe with the following information for each variant: the chromosome name, the start of the variant, its quality, the reference and alternate alleles, the number of alternate alleles, the number of reads supporting the reference and alternate alleles, the percent of reads supporting the alternate allele, the variant type, its predicted functional effect, and its frequency in ExAC
+	# vcf is the VCF object to annotate
+	# variant effects is an optional data frame with the ranking of variant severity. It should have two columns, one titled "impact" which has the variant impact label and one labelled "effect" which gives an ascending numeric ranking of the variant severity (so the most benign variant impacts will have the smallest effect and the most severe variants will have the largest)
+	
+	alt_alleles <- alt(vcf)
+	# there can be multiple alleles so collapse them into a single character value 
+	alt_alleles_collapsed <- laply(alt_alleles, collapse_alleles)
+	annotation <- data.frame(chr=as.character(seqnames(vcf)), start=start(vcf),  qual=qual(vcf), ref=as.character(ref(vcf)), alt=alt_alleles_collapsed)
+	loc_id <- paste0(annotation$chr, "_", annotation$start)
+	annotation$loc_id <- loc_id
+	# extract depth information from the info fields
+	vcf_info <- info(vcf)
+	annotation$num_alt_alleles <- vcf_info$NUMALT
+	annotation$total_depth <- vcf_info$DP
+	annotation$reference_depth <- vcf_info$RO
+
+	total_alt_dp <- vcf_info$AO
+	# there can be multiple alleles so collapse depths into a single character value 
+	annotation$n_alt_reads <- laply(total_alt_dp, function(x) ifelse(length(x) > 1, collapse_alleles(x), as.character(x)))
+
+	alt_read_percent <- round(total_alt_dp/annotation$total_depth*100,4)
+	annotation$alt_read_percent <- laply(alt_read_percent, function(x) ifelse(length(x) > 1, collapse_alleles(x), as.character(x)))
+	annotation$variant_type <- laply(vcf_info$TYPE, function(x) ifelse(length(x) > 1, collapse_alleles(unlist(x)), as.character(unlist(x))))
+
+	variant_effects <- extract_variant_effects(vcf, variant_effects=variant_effects)
+	allele_freq <- annotate_ExAC_AF(annotation, vcf)
+
+	annotation <- merge(annotation, allele_freq[,c("loc_id", "ExAC_AF")], all.x=TRUE, by="loc_id")
+	annotation <- merge(annotation, variant_effects, all.x=TRUE, by="loc_id")
+	# put the annotation in the same order as the original vcf
+	annotation <- annotation[match(loc_id, annotation$loc_id),]
+	annotation$loc_id <- NULL
+	return(annotation)
 }
 
 collapse_alleles <- function(x, separator=","){
-	# collapses a vector of alleles and outputs a character vector of length(1) with all alleles separated by a user defined separator
+	# collapses a vector of alleles 
+	# returns a character vector of length(1) with all alleles separated by a user defined separator
 	# x is a character vector of alleles
 	# separator is a character vector of length 1 with the character to be used to separate alternative alleles
 	collapsed_alleles <- ifelse(length(x) == 1, as.character(x), paste(x, collapse=separator))
@@ -58,48 +108,12 @@ collapse_alleles <- function(x, separator=","){
 	return(collapsed_alleles)
 }
 
-annotate_ExAC_AF <- function(annotation, vcf, alt_alleles){
-	# annotation is a data frame with at least four columns:  
-	# generate the basic ExAC query format necessary
-	ExAC_query <- paste0(annotation$chr,"-", annotation$start,"-",annotation$ref,"-",annotation$alt)
-	# if a variant has more than one alternate allele separate each into a separate query
-	multi_allele <- sapply(grep(',',ExAC_query), function(i){
-															site <- annotation[i,];
-															paste0(site$chr,"-", site$start,"-",site$ref,"-", as.character(alt_alleles[[i]]))
-															})
-	multi_allele <- unlist(multi_allele)
-	ExAC_query <- c(ExAC_query[grep(',',ExAC_query, invert=TRUE)], multi_allele)
-	# query ExAC and format as json
-	ExAC_results <- httr::POST(url="http://exac.hms.harvard.edu/rest/bulk/variant", body=jsonlite::toJSON(as.character(ExAC_query)), encode = "json")
-	ExAC_json <- content(ExAC_results)
-	allele_freq <- ldply(ExAC_json, .id='exac_variant_id', function(x) ifelse(!is.null(x$variant$allele_freq), x$variant$allele_freq, NA))
-	colnames(allele_freq)[2] <- "ExAC_AF"
-	if(all(is.na(allele_freq$ExAC_AF))){
-		stop("Something is wrong, all ExAC allele frequencies are missing")
-	}
-	
-	allele_freq$loc_id <- gsub("-","_",gsub("-[ACTG]*-.*","",allele_freq$exac_variant_id))
-	# reorder the data frame to reflect the order of the original query so that allele order will also be preserved
-	allele_freq <- allele_freq[match(ExAC_query, allele_freq$exac_variant_id),]
-	# consolidate allele frequencies for variants with more than a single alternate allele
-	if(any(allele_freq$exac_variant_id %in% multi_allele)){
-		multi_allele_freq <- ddply(allele_freq[which(allele_freq$exac_variant_id %in% multi_allele),], .(loc_id), function(x){
-																															return(paste(x$ExAC_AF, collapse=','))
-																															})
-		colnames(multi_allele_freq)[2] <- "ExAC_AF"
-		allele_freq <- rbind.fill(allele_freq[!(allele_freq$exac_variant_id %in% multi_allele),], multi_allele_freq)
-	}
-	if(nrow(allele_freq) != length(vcf)){
-		stop("ExAC annotation length does not match vcf length")
-	}
-	return(allele_freq)
-
-}
-
 extract_variant_effects <- function(vcf, variant_effects=NULL){
-	# annotates each variant in a VCF object with 
+	# annotates each variant in a VCF object with its functional effect based on its sequence position relative to genes
+	# returns a two column data frame with the locus ID and the most deleterious predicted impact for that variant
 	# vcf is the VCF object to annotate
-	#  variant effects is an optional data frame with the ranking of variant severity. It should have two columns, one titled "impact" which has the variant impact label and one labelled "effect" which gives an ascending numeric ranking of the variant severity (so the most benign variant impacts will have the smallest effect and the most severe variants will have the largest)
+	# variant effects is an optional data frame with the ranking of variant severity. It should have two columns, one titled "impact" which has the variant impact label and one labelled "effect" which gives an ascending numeric ranking of the variant severity (so the most benign variant impacts will have the smallest effect and the most severe variants will have the largest)
+	
 	# change chromosome names to be compatible with UCSC
 	vcf_query <- keepStandardChromosomes(vcf)
 	vcf_query <- dropSeqlevels(vcf_query,"MT")
@@ -140,44 +154,46 @@ extract_variant_effects <- function(vcf, variant_effects=NULL){
 }
 
 
-annotate_variants <- function(vcf){
+annotate_ExAC_AF <- function(annotation, vcf){
+	# annotates each variant in a VCF object with its allele frequency in the ExAC database by querying the ExAC API. Requires a functioning internet connection.
+	# returns a three column data frame with the locus ID, the variant ID in the ExAC data base, and the allele frequency for each variant in ExAC
+	# annotation is a data frame with at least four columns: chr which is a character vector with the chromosome id, start which is a numeric vector of variant start positions, ref which is a character vector with the reference allele, and alt which is a character vectpr with the alternate allele
+	# vcf is the VCF object to annotate
 
-
+	# generate the basic ExAC query format necessary
+	ExAC_query <- paste0(annotation$chr,"-", annotation$start,"-",annotation$ref,"-",annotation$alt)	
+	# if a variant has more than one alternate allele separate each into a separate query
 	alt_alleles <- alt(vcf)
-	# there can be multiple alleles so collapse them into a single character value 
-	alt_alleles_collapsed <- laply(alt_alleles, collapse_alleles)
-	annotation <- data.frame(chr=as.character(seqnames(vcf)), start=start(vcf), loc_id=rownames(info(vcf)), qual=qual(vcf), ref=as.character(ref(vcf)), alt=alt_alleles_collapsed, reference_dp=info(vcf)$RO)
-	# extract depth information from the info fields
-	vcf_info <- info(vcf)
-	total_depth <- vcf_info$DP
-	total_alt_dp <- vcf_info$AO
-	total_alt_dp_collapsed <- laply(total_alt_dp, function(x) ifelse(length(x) > 1, collapse_alleles(x), as.character(x)))
-	total_alt_read_percent <- round(total_alt_dp/total_depth*100,2)
-	total_alt_read_percent_collapsed <- laply(total_alt_read_percent, function(x) ifelse(length(x) > 1, collapse_alleles(x), as.character(x)))
-
-	allele_freq <- annotate_ExAC_AF(annotation, vcf, alt_alleles)
-	variant_effects <- extract_variant_effects(vcf)
-	variant_type <- laply(vcf_info$TYPE, function(x) ifelse(length(x) > 1, collapse_alleles(unlist(x)), as.character(unlist(x))))
-
-	annotation 
-
-	return(data.frame(total_depth=total_depth, n_alt_reads=total_alt_dp_collapsed, total_alt_read_percent=total_alt_read_percent_collapsed))	
-}
-
-
-run_annotation <- function(vcf, samples, chunk_size=1000){
-	
-	n_variants <- length(vcf)
-	if(chunk_size < Inf){
-		#users may have different memory constraints depending on the file size and system 
-		range_start <- seq(1,n_variants, by=chunk_size)
-		range_end <- seq((chunk_size+1), n_variants,by=chunk_size)
-		range_end <- c(range_end, n_variants)
-		vcf_ranges <- cbind(range_start, range_end)
-	}else{
-		vcf_ranges <- matrix(c(1, n_variants), nrow=1, ncol=2)
+	multi_allele <- sapply(grep(',',ExAC_query), function(i){
+															site <- annotation[i,];
+															paste0(site$chr,"-", site$start,"-",site$ref,"-", as.character(alt_alleles[[i]]))
+															})
+	multi_allele <- unlist(multi_allele)
+	ExAC_query <- c(ExAC_query[grep(',',ExAC_query, invert=TRUE)], multi_allele)
+	# query ExAC, format as json, and extract the allele frequencies
+	ExAC_results <- httr::POST(url="http://exac.hms.harvard.edu/rest/bulk/variant", body=jsonlite::toJSON(as.character(ExAC_query)), encode = "json")
+	ExAC_json <- content(ExAC_results)
+	allele_freq <- ldply(ExAC_json, .id='exac_variant_id', function(x) ifelse(!is.null(x$variant$allele_freq), x$variant$allele_freq, NA))
+	colnames(allele_freq)[2] <- "ExAC_AF"
+	if(all(is.na(allele_freq$ExAC_AF))){
+		stop("Something is wrong, all ExAC allele frequencies are missing")
 	}
-	# source("helper_functions.R")
-	variant_annotation <- adply(vcf_ranges, 1, .id='id',function(x) annotate_variants(vcf[x[1]:x[2]]))
-}
+	
+	allele_freq$loc_id <- gsub("-","_",gsub("-[ACTG]*-.*","",allele_freq$exac_variant_id))
+	# reorder the data frame to reflect the order of the original query so that allele order will also be preserved
+	allele_freq <- allele_freq[match(ExAC_query, allele_freq$exac_variant_id),]
+	# consolidate allele frequencies for variants with more than a single alternate allele
+	if(any(allele_freq$exac_variant_id %in% multi_allele)){
+		multi_allele_freq <- ddply(allele_freq[which(allele_freq$exac_variant_id %in% multi_allele),], .(loc_id), function(x){
+																															return(paste(x$ExAC_AF, collapse=','))
+																															})
+		colnames(multi_allele_freq)[2] <- "ExAC_AF"
+		allele_freq <- rbind.fill(allele_freq[!(allele_freq$exac_variant_id %in% multi_allele),], multi_allele_freq)
+	}
+	if(nrow(allele_freq) != length(vcf)){
+		stop("ExAC annotation length does not match vcf length")
+	}
 
+	return(allele_freq)
+
+}
