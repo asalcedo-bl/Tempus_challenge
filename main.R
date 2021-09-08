@@ -17,7 +17,7 @@ chunk_size <- tmp[[3]]
 
 annotation <- run_annotation(vcf, chunk_size=chunk_size)
 
-write.table(annotation, file=output_file, sep='\t', quotes=TRUE, row.names=FALSE)
+write.table(annotation, file=output_file, sep='\t', quote=TRUE, row.names=FALSE)
 
 
 

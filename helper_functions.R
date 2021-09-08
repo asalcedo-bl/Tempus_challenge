@@ -57,6 +57,9 @@ run_annotation <- function(vcf, chunk_size=NULL, variant_effects=NULL){
 	
 	variant_annotation <- adply(vcf_ranges, 1, .id='id',function(x) annotate_variants(vcf[x[1]:x[2]], variant_effects=variant_effects))
 	variant_annotation$id <- NULL
+	if(nrow(variant_annotation) != length(vcf)){
+		warn("number of rows in annotation do not match the original VCF")
+	}
 	return(variant_annotation)
 }
 
@@ -108,6 +111,14 @@ collapse_alleles <- function(x, separator=","){
 	return(collapsed_alleles)
 }
 
+
+default_variant_effect <- function(){
+	# outputs the default variant effect dataframe
+	return(data.frame(impact = c("coding","synonymous", "intergenenic", "intron", "threeUTR", "fiveUTR", "promoter",  "spliceSite", "nonsynonymous", "frameshift", "nonsense"),
+										  effect = c(1:11)
+										))
+}
+
 extract_variant_effects <- function(vcf, variant_effects=NULL){
 	# annotates each variant in a VCF object with its functional effect based on its sequence position relative to genes
 	# returns a two column data frame with the locus ID and the most deleterious predicted impact for that variant
@@ -139,9 +150,7 @@ extract_variant_effects <- function(vcf, variant_effects=NULL){
 	all_var_df$loc_id <- gsub(":","_", gsub("_[ACTG].*","",all_var_df$id))
 
 	if(is.null(variant_effects)){
-		variant_effects <- data.frame(impact = c("coding","synonymous", "intergenenic", "intron", "threeUTR", "fiveUTR", "promoter",  "spliceSite", "nonsynonymous", "frameshift", "nonsense"),
-									  effect = c(1:11)
-									)
+		variant_effects <- default_variant_effect()
 	}
 
 	# for each locus output the more deleterious consequence as defined by the variant_effects dataframe
